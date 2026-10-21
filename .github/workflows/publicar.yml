@@ -1,0 +1,65 @@
+name: Publicar mapas y rutas
+
+# Se ejecuta a mano desde la pestaña Actions (botón "Run workflow").
+# Deja un Release con, por cada región: <region>-rutas.tar (Valhalla), <region>-mapa.pmtiles (Protomaps) e indice.json.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # para crear el Release con el token del propio flujo
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Probar las herramientas
+        run: |
+          python3 herramientas/cortar_regiones.py
+          python3 herramientas/indice.py
+
+      - name: Descargar OpenStreetMap de Chile
+        run: |
+          mkdir -p trabajo salida
+          curl -fsSL -o trabajo/chile.osm.pbf https://download.geofabrik.de/south-america/chile-latest.osm.pbf
+          ls -lh trabajo
+
+      # Misma versión de Valhalla que trae valhalla-mobile 0.6.4 en la app: las teselas deben ser compatibles.
+      - name: Construir teselas de Valhalla (todo Chile)
+        run: |
+          docker run --rm -v "$PWD/trabajo:/data" --entrypoint bash ghcr.io/valhalla/valhalla:3.9.1 -c \
+            "valhalla_build_config --mjolnir-tile-dir /data/teselas --mjolnir-concurrency 2 > /data/valhalla.json \
+             && valhalla_build_tiles -c /data/valhalla.json /data/chile.osm.pbf"
+          du -sh trabajo/teselas
+
+      - name: Cortar rutas por región
+        run: python3 herramientas/cortar_regiones.py trabajo/teselas herramientas/regiones.json salida
+
+      - name: Extraer el mapa de cada región
+        run: |
+          curl -fsSL https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_Linux_x86_64.tar.gz | tar -xz -C trabajo pmtiles
+          # Protomaps publica un mapa del mundo cada día; se usa el más reciente de la última semana.
+          for d in 0 1 2 3 4 5 6 7; do
+            URL="https://build.protomaps.com/$(date -u -d "-$d day" +%Y%m%d).pmtiles"
+            curl -fsIL "$URL" > /dev/null && break || URL=""
+          done
+          [ -n "$URL" ] || { echo "No hay un mapa de Protomaps de la última semana"; exit 1; }
+          echo "Mapa base: $URL"
+          python3 -c 'import json; [print(k, ",".join(map(str, v["rect"]))) for k, v in json.load(open("herramientas/regiones.json", encoding="utf-8")).items() if not k.startswith("_")]' |
+            while read -r clave rect; do
+              trabajo/pmtiles extract "$URL" "salida/$clave-mapa.pmtiles" --bbox="$rect"
+              ls -lh "salida/$clave-mapa.pmtiles"
+            done
+
+      - name: Armar indice.json
+        run: python3 herramientas/indice.py herramientas/regiones.json salida "$(date -u +%Y-%m-%d)"
+
+      - name: Publicar el Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ETIQUETA="datos-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          gh release create "$ETIQUETA" salida/* --title "Datos $(date -u +%Y-%m-%d)" \
+            --notes "Rutas (Valhalla 3.9.1) y mapas (Protomaps) por región, a partir de OpenStreetMap. Datos © colaboradores de OpenStreetMap, licencia ODbL."
